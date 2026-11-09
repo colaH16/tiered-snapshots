@@ -1,0 +1,83 @@
+# Example: snapshot two PVCs every 4h (Asia/Seoul), keep all for 7 days,
+# 1 per 12h until 30 days, 1 per day until 90 days, then delete.
+# Everything is namespaced; no ClusterRole, no CRD, no resident pod.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tiered-snapshots
+  namespace: my-app
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tiered-snapshots
+  namespace: my-app
+rules:
+  - apiGroups: ['']
+    resources: [persistentvolumeclaims]
+    resourceNames: [data, db]          # with CLAIM_SELECTOR: drop resourceNames, add `list`
+    verbs: [get]
+  - apiGroups: [snapshot.storage.k8s.io]
+    resources: [volumesnapshots]
+    verbs: [get, list, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tiered-snapshots
+  namespace: my-app
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tiered-snapshots
+subjects:
+  - kind: ServiceAccount
+    name: tiered-snapshots
+    namespace: my-app
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tiered-snapshots
+  namespace: my-app
+spec:
+  schedule: '0 */4 * * *'          # must match INTERVAL
+  timeZone: Asia/Seoul             # must match TIMEZONE
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: tiered-snapshots
+          automountServiceAccountToken: true
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: tiered-snapshots
+              image: ghcr.io/colah16/tiered-snapshots:main   # pin a digest in production
+              env:
+                - {name: CLAIMS, value: 'data,db'}
+                - {name: SNAPSHOT_CLASS, value: csi-rbdplugin-snapclass}
+                - {name: POLICY, value: my-app-v1}
+                - {name: INTERVAL, value: 4h}
+                - {name: TIERS, value: '7d:3,30d:2'}
+                - {name: MAX_AGE, value: 90d}
+                - {name: TIMEZONE, value: Asia/Seoul}
+                - name: JOB_NAME
+                  valueFrom:
+                    fieldRef: {fieldPath: "metadata.labels['batch.kubernetes.io/job-name']"}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 10m, memory: 16Mi}
+                limits: {cpu: 200m, memory: 64Mi}
