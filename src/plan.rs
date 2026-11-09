@@ -8,12 +8,15 @@
 //! its narrower sub-bucket: a snapshot that survived tier N never gets deleted
 //! later just because it reached tier N+1 — only its siblings do.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 
 use crate::config::Config;
+use crate::zone::Zone;
+
+/// Target PVC → the VolumeSnapshotClass its snapshots use.
+pub type Claims = BTreeMap<String, String>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snap {
@@ -47,27 +50,26 @@ pub struct Deletion {
     pub reason: Reason,
 }
 
-fn local_seconds(at: DateTime<Utc>, tz: Tz) -> i64 {
+fn local_seconds(at: DateTime<Utc>, tz: &Zone) -> i64 {
     // Seconds since 1970-01-01T00:00 *local wall clock*, so day-multiple widths
     // align to local midnight.
-    at.with_timezone(&tz).naive_local().and_utc().timestamp()
+    tz.to_local(at).and_utc().timestamp()
 }
 
 /// Start of the level-1 window containing `now`, as UTC.
-pub fn window_start(now: DateTime<Utc>, interval: Duration, tz: Tz) -> DateTime<Utc> {
+pub fn window_start(now: DateTime<Utc>, interval: Duration, tz: &Zone) -> DateTime<Utc> {
     let width = interval.num_seconds().max(1);
     let secs = local_seconds(now, tz);
     let floored = secs - secs.rem_euclid(width);
     let naive: NaiveDateTime = DateTime::from_timestamp(floored, 0)
         .expect("in range")
         .naive_utc();
-    match tz.from_local_datetime(&naive).earliest() {
-        Some(local) => local.with_timezone(&Utc),
+    match tz.utc_of_local(&naive) {
+        Some(local) => local,
         // Window start fell into a DST gap: use the gap's end, never a future time.
         None => tz
-            .from_local_datetime(&(naive + Duration::hours(1)))
-            .earliest()
-            .map(|l| l.with_timezone(&Utc).min(now))
+            .utc_of_local(&(naive + Duration::hours(1)))
+            .map(|l| l.min(now))
             .unwrap_or(now),
     }
 }
@@ -90,7 +92,7 @@ fn has_stamp_suffix(name: &str, claim: &str) -> bool {
 }
 
 /// Strict ownership: only snapshots this policy could have created are ever deleted.
-pub fn owned(s: &Snap, cfg: &Config, claims: &BTreeSet<String>) -> bool {
+pub fn owned(s: &Snap, cfg: &Config, claims: &Claims) -> bool {
     let Some(claim) = s.claim.as_deref() else {
         return false;
     };
@@ -98,8 +100,9 @@ pub fn owned(s: &Snap, cfg: &Config, claims: &BTreeSet<String>) -> bool {
         && s.policy
             .as_ref()
             .is_some_and(|p| cfg.policies().contains(p))
-        && s.class.as_deref() == Some(cfg.snapshot_class.as_str())
-        && claims.contains(claim)
+        && claims
+            .get(claim)
+            .is_some_and(|class| s.class.as_deref() == Some(class.as_str()))
         && has_stamp_suffix(&s.name, claim)
 }
 
@@ -107,7 +110,7 @@ pub fn plan(
     snaps: &[Snap],
     now: DateTime<Utc>,
     cfg: &Config,
-    claims: &BTreeSet<String>,
+    claims: &Claims,
     protected: &BTreeSet<String>,
 ) -> Vec<Deletion> {
     let candidates: Vec<(&Snap, DateTime<Utc>)> = snaps
@@ -132,7 +135,7 @@ pub fn plan(
     for (i, tier) in cfg.tiers.iter().enumerate() {
         let width = widths[i].num_seconds();
         let next_after = cfg.tiers.get(i + 1).map(|t| t.after);
-        let bucket = |c: DateTime<Utc>| local_seconds(c, cfg.timezone).div_euclid(width);
+        let bucket = |c: DateTime<Utc>| local_seconds(c, &cfg.timezone).div_euclid(width);
         // Keeper per (claim, bucket): earliest ready snapshot among ALL live ones,
         // regardless of their own age, so boundaries between tiers stay consistent.
         let mut keepers: HashMap<(&str, i64), (DateTime<Utc>, &str)> = HashMap::new();
@@ -183,14 +186,15 @@ mod tests {
         Config {
             namespace: "myapps".into(),
             claims: ClaimSource::Names(["a".to_string(), "b".to_string()].into()),
-            snapshot_class: "rbd".into(),
+            snapshot_class: Some("rbd".into()),
             policy_label: "x/policy".into(),
             policy: "p-v2".into(),
             adopt_policies: vec!["p-v1".into()],
             interval: Duration::hours(4),
             tiers,
             max_age,
-            timezone: "Asia/Seoul".parse().unwrap(),
+            timezone: Zone::Named("Asia/Seoul".parse().unwrap()),
+            timezone_source: String::new(),
             ready_timeout: std::time::Duration::from_secs(900),
             require_storage_class: None,
             dry_run: false,
@@ -217,8 +221,12 @@ mod tests {
         )
     }
 
-    fn claims() -> BTreeSet<String> {
-        ["a".to_string(), "b".to_string()].into()
+    fn claims() -> Claims {
+        [
+            ("a".to_string(), "rbd".to_string()),
+            ("b".to_string(), "rbd".to_string()),
+        ]
+        .into()
     }
 
     fn snap(claim: &str, created: DateTime<Utc>) -> Snap {
@@ -254,7 +262,7 @@ mod tests {
 
     #[test]
     fn window_alignment_kst() {
-        let tz: Tz = "Asia/Seoul".parse().unwrap();
+        let tz = &Zone::Named("Asia/Seoul".parse().unwrap());
         // 2026-11-09 13:07 KST → 12:00 KST window = 03:00 UTC.
         let w = window_start(utc("2026-11-09T04:07:00Z"), Duration::hours(4), tz);
         assert_eq!(w, utc("2026-11-09T03:00:00Z"));
@@ -266,7 +274,7 @@ mod tests {
 
     #[test]
     fn window_alignment_dst_zone() {
-        let tz: Tz = "Europe/Berlin".parse().unwrap();
+        let tz = &Zone::Named("Europe/Berlin".parse().unwrap());
         // Spring forward 2026-03-29 02:00→03:00 local. 03:30 local (01:30 UTC),
         // 2h window → local 02:00 does not exist → clamp, never in the future.
         let now = utc("2026-03-29T01:30:00Z");
@@ -296,6 +304,7 @@ mod tests {
             Box::new(|s| s.policy = Some("foreign".into())),
             Box::new(|s| s.policy = None),
             Box::new(|s| s.class = Some("other".into())),
+            Box::new(|s| s.claim = Some("b".into())), // b exists, but name prefix is a-
             Box::new(|s| s.claim = Some("zzz".into())),
             Box::new(|s| s.name = "a-manual".into()),
         ];

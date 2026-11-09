@@ -1,6 +1,8 @@
 # Example: snapshot two PVCs every 4h (Asia/Seoul), keep all for 7 days,
 # 1 per 12h until 30 days, 1 per day until 90 days, then delete.
-# Everything is namespaced; no ClusterRole, no CRD, no resident pod.
+# Namespaced RBAC only (SNAPSHOT_CLASS is set); no CRD, no resident pod.
+# To detect the class per PVC instead, unset SNAPSHOT_CLASS and apply the
+# optional ClusterRole at the end of this file.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -70,7 +72,7 @@ spec:
                 - {name: INTERVAL, value: 4h}
                 - {name: TIERS, value: '7d:3,30d:2'}
                 - {name: MAX_AGE, value: 90d}
-                - {name: TIMEZONE, value: Asia/Seoul}
+                - {name: TIMEZONE, value: Asia/Seoul}   # or omit and mount /etc/localtime below
                 - name: JOB_NAME
                   valueFrom:
                     fieldRef: {fieldPath: "metadata.labels['batch.kubernetes.io/job-name']"}
@@ -81,3 +83,32 @@ spec:
               resources:
                 requests: {cpu: 10m, memory: 16Mi}
                 limits: {cpu: 200m, memory: 64Mi}
+              # Follow the node's time zone instead of TIMEZONE:
+              # volumeMounts: [{name: localtime, mountPath: /etc/localtime, readOnly: true}]
+          # volumes: [{name: localtime, hostPath: {path: /etc/localtime, type: File}}]
+---
+# Optional: only when SNAPSHOT_CLASS is unset (detect class from each PVC's StorageClass).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tiered-snapshots-class-reader
+rules:
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get]
+  - apiGroups: [snapshot.storage.k8s.io]
+    resources: [volumesnapshotclasses]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tiered-snapshots-class-reader-my-app
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tiered-snapshots-class-reader
+subjects:
+  - kind: ServiceAccount
+    name: tiered-snapshots
+    namespace: my-app

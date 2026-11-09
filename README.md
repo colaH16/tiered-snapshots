@@ -31,7 +31,7 @@ If a fresh snapshot errors or is not ready within `READY_TIMEOUT`, nothing is de
 | | tiered-snapshots | [Gemini](https://github.com/FairwindsOps/gemini) | [snapscheduler](https://github.com/backube/snapscheduler) |
 |---|---|---|---|
 | Runtime | CronJob (runs, exits) | operator + CRD | operator + CRD |
-| RBAC | one namespaced Role | cluster-wide | cluster-wide |
+| RBAC | one namespaced Role (+ read-only ClusterRole only for class detection) | cluster-wide | cluster-wide |
 | Retention model | age thresholds + "keep 1 of N" | count per granularity | count / age |
 | Restore helpers | none (standard `dataSource`) | annotation-driven | none |
 | Adopt pre-existing snapshots | yes (`ADOPT_POLICIES`) | no | no |
@@ -71,12 +71,12 @@ preconditions.
 |---|---|---|---|
 | `CLAIMS` | one of | | comma-separated PVC names |
 | `CLAIM_SELECTOR` | one of | | label selector for PVCs (needs `list` on PVCs) |
-| `SNAPSHOT_CLASS` | yes | | VolumeSnapshotClass for new snapshots |
+| `SNAPSHOT_CLASS` | no | detect | VolumeSnapshotClass; unset = detect per PVC (needs a ClusterRole, see below) |
 | `POLICY` | yes | | label value identifying this schedule's snapshots |
 | `INTERVAL` | yes | | level-1 period; **must match the CronJob schedule** |
 | `TIERS` | no | none | `<age>:<N>,…`, ages strictly increasing, N ≥ 2 |
 | `MAX_AGE` | yes | | delete anything older; must exceed the last tier age |
-| `TIMEZONE` | no | `UTC` | IANA zone for window/bucket alignment; match `spec.timeZone` |
+| `TIMEZONE` | no | `TZ` → `/etc/localtime` → UTC | IANA zone for window/bucket alignment; match `spec.timeZone` |
 | `NAMESPACE` | no | pod namespace | |
 | `POLICY_LABEL` | no | `tiered-snapshots/policy` | label key |
 | `ADOPT_POLICIES` | no | | extra label values to treat as owned (migrations) |
@@ -90,8 +90,63 @@ preconditions.
 
 Durations: `30m`, `4h`, `7d`, `2w`, or combined like `1d12h`.
 
+Invalid schedules are rejected before anything runs, with the reason and a fix —
+for example `TIERS=30d:3,7d:2`:
+
+```
+config error: TIERS level 3 (7d:2) starts at 7d, which is not later than level 2 (starts at 30d).
+Each level thins what the previous level kept, so levels must start at strictly increasing ages,
+e.g. TIERS=7d:3,30d:2.
+```
+
+Legal but odd settings (an `INTERVAL` that does not divide 24h, a level too short to hold
+a snapshot, hundreds of snapshots per PVC) run with a `warning:` line.
+
 Exit codes: `0` success · `1` failure · `2` invalid configuration ·
 `DEFERRED_EXIT_CODE` not ready in time.
+
+### Time zone
+
+Windows and buckets follow local wall-clock time. Resolution order: `TIMEZONE`
+(IANA name) → `TZ` → `/etc/localtime` → UTC. Containers do not inherit the node's
+zone; to follow the host, mount it read-only:
+
+```yaml
+volumeMounts: [{name: localtime, mountPath: /etc/localtime, readOnly: true}]
+volumes: [{name: localtime, hostPath: {path: /etc/localtime, type: File}}]
+```
+
+Whatever you pick, keep the CronJob's `spec.timeZone` the same. The log states the
+zone and where it came from.
+
+### Snapshot class detection
+
+With `SNAPSHOT_CLASS` unset, each PVC's StorageClass `provisioner` is matched against
+VolumeSnapshotClass `driver`: a single match is used; with several, the one annotated
+`snapshot.storage.kubernetes.io/is-default-class: "true"`; otherwise the run stops and
+names the candidates. Both kinds are cluster-scoped, so this needs a read-only
+ClusterRole (`get storageclasses`, `list volumesnapshotclasses`); setting
+`SNAPSHOT_CLASS` keeps the tool namespace-only. Ownership is per PVC: only snapshots
+in that PVC's class are ever pruned.
+
+### Run log
+
+```
+retention policy "app-v1": INTERVAL=4h TIERS=7d:3,30d:2 MAX_AGE=60d TIMEZONE=Asia/Seoul
+  time zone Asia/Seoul (from /etc/localtime → Asia/Seoul)
+  pvc data → snapshot class csi-rbdplugin-snapclass (SNAPSHOT_CLASS)
+  level  age           taken between                          spacing  rule          per PVC
+  L1     0d → 7d       2026-11-09 14:53 … 2026-11-02 14:53         4h  keep all           42
+  L2     7d → 30d      2026-11-02 14:53 … 2026-10-10 14:53        12h  keep 1 of 3        46
+  L3     30d → 60d     2026-10-10 14:53 … 2026-09-10 14:53         1d  keep 1 of 2        30
+                                                                              total      118
+  older than 60d (2026-09-10 14:53) is deleted · 1 PVC(s) → about 118 snapshots in steady state
+...
+kept per PVC:
+  pvc     L1    L2    L3  total  oldest kept
+  data    42    46    30    118  2026-09-10 15:00 (59d23h ago)
+  target  42    46    30    118  (steady-state target)
+```
 
 ### Status file
 

@@ -7,7 +7,8 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Duration;
-use chrono_tz::Tz;
+
+use crate::zone::{self, Zone};
 
 /// One thinning level: snapshots older than `after` keep 1 of every `keep_every`
 /// snapshots of the previous level.
@@ -27,7 +28,8 @@ pub enum ClaimSource {
 pub struct Config {
     pub namespace: String,
     pub claims: ClaimSource,
-    pub snapshot_class: String,
+    /// None = detect per PVC from its StorageClass driver (needs a read-only ClusterRole).
+    pub snapshot_class: Option<String>,
     pub policy_label: String,
     pub policy: String,
     pub adopt_policies: Vec<String>,
@@ -36,7 +38,9 @@ pub struct Config {
     /// Level 2..N, sorted by `after`.
     pub tiers: Vec<Tier>,
     pub max_age: Duration,
-    pub timezone: Tz,
+    pub timezone: Zone,
+    /// Where `timezone` came from, for the run log.
+    pub timezone_source: String,
     pub ready_timeout: StdDuration,
     pub require_storage_class: Option<String>,
     pub dry_run: bool,
@@ -67,10 +71,26 @@ impl Config {
     }
 
     pub fn from_env() -> Result<Self> {
-        Self::from_lookup(|k| std::env::var(k).ok())
+        let get = |k: &str| std::env::var(k).ok();
+        let probe = zone::Probe::system(get("TIMEZONE").filter(|v| !v.trim().is_empty()));
+        Self::from_lookup_with_zone(get, &probe)
     }
 
+    #[cfg(test)]
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let probe = zone::Probe {
+            timezone: get("TIMEZONE"),
+            tz: None,
+            localtime_link: None,
+            localtime_exists: false,
+        };
+        Self::from_lookup_with_zone(get, &probe)
+    }
+
+    pub fn from_lookup_with_zone(
+        get: impl Fn(&str) -> Option<String>,
+        probe: &zone::Probe,
+    ) -> Result<Self> {
         let req = |k: &str| -> Result<String> {
             get(k)
                 .map(|v| v.trim().to_string())
@@ -116,10 +136,7 @@ impl Config {
             None => Vec::new(),
         };
         let max_age = parse_duration(&req("MAX_AGE")?).context("MAX_AGE")?;
-        let timezone: Tz = opt("TIMEZONE")
-            .unwrap_or_else(|| "UTC".into())
-            .parse()
-            .map_err(|e| anyhow::anyhow!("TIMEZONE: {e}"))?;
+        let (timezone, timezone_source) = zone::resolve(probe)?;
         let ready_timeout = parse_duration(&opt("READY_TIMEOUT").unwrap_or_else(|| "15m".into()))
             .context("READY_TIMEOUT")?
             .to_std()?;
@@ -149,7 +166,7 @@ impl Config {
         let cfg = Config {
             namespace,
             claims,
-            snapshot_class: req("SNAPSHOT_CLASS")?,
+            snapshot_class: opt("SNAPSHOT_CLASS"),
             policy_label: opt("POLICY_LABEL").unwrap_or_else(|| "tiered-snapshots/policy".into()),
             policy,
             adopt_policies,
@@ -157,6 +174,7 @@ impl Config {
             tiers,
             max_age,
             timezone,
+            timezone_source,
             ready_timeout,
             require_storage_class: opt("REQUIRE_STORAGE_CLASS"),
             dry_run,
@@ -172,25 +190,177 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Hard errors: settings that cannot describe a meaningful schedule.
+    /// Every message says what is wrong, why, and how to fix it.
     pub fn validate(&self) -> Result<()> {
         if self.interval < Duration::minutes(1) {
-            bail!("INTERVAL must be at least 1m");
+            bail!(
+                "INTERVAL={} is shorter than 1m: a CronJob cannot run more than once a minute.",
+                fmt_dur(self.interval)
+            );
         }
-        let mut previous = Duration::zero();
-        for tier in &self.tiers {
+        let mut previous_start = Duration::zero();
+        let mut previous_spacing = self.interval;
+        for (i, tier) in self.tiers.iter().enumerate() {
+            let level = i + 2;
+            let spec = format!("{}:{}", fmt_dur(tier.after), tier.keep_every);
             if tier.keep_every < 2 {
-                bail!("keep-every must be >= 2 (got {})", tier.keep_every);
+                bail!(
+                    "TIERS level {level} ({spec}): keep 1 of {} keeps every snapshot, so this \
+                     level would change nothing. Use 2 or more, or remove the level.",
+                    tier.keep_every
+                );
             }
-            if tier.after <= previous {
-                bail!("tier ages must be strictly increasing and > 0");
+            if tier.after <= previous_start {
+                bail!(
+                    "TIERS level {level} ({spec}) starts at {}, which is not later than level {} \
+                     ({}). Each level thins what the previous level kept, so levels must start \
+                     at strictly increasing ages, e.g. TIERS=7d:3,30d:2.",
+                    fmt_dur(tier.after),
+                    level - 1,
+                    if level == 2 {
+                        "0d, i.e. the newest snapshot".to_string()
+                    } else {
+                        format!("starts at {}", fmt_dur(previous_start))
+                    },
+                );
             }
-            previous = tier.after;
+            if tier.after <= previous_spacing {
+                bail!(
+                    "TIERS level {level} ({spec}) starts at {}, but level {} only takes one \
+                     snapshot every {}. Level {} would end before it holds a single snapshot; \
+                     start level {level} later than {}.",
+                    fmt_dur(tier.after),
+                    level - 1,
+                    fmt_dur(previous_spacing),
+                    level - 1,
+                    fmt_dur(previous_spacing),
+                );
+            }
+            previous_start = tier.after;
+            previous_spacing = previous_spacing * tier.keep_every as i32;
         }
-        if self.max_age <= previous || self.max_age <= self.interval {
-            bail!("MAX_AGE must exceed the last tier age and INTERVAL");
+        let last_level = self.tiers.len() + 1;
+        if self.max_age <= previous_start {
+            bail!(
+                "MAX_AGE={} is not later than level {last_level}'s start ({}): every snapshot \
+                 would be deleted before reaching level {last_level}. Raise MAX_AGE or drop \
+                 the level.",
+                fmt_dur(self.max_age),
+                fmt_dur(previous_start)
+            );
+        }
+        if self.max_age <= self.interval {
+            bail!(
+                "MAX_AGE={} is not longer than INTERVAL={}: each snapshot would be deleted \
+                 before the next one is taken.",
+                fmt_dur(self.max_age),
+                fmt_dur(self.interval)
+            );
         }
         Ok(())
     }
+
+    /// Soft warnings: valid, but probably not what was intended.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = vec![];
+        let day = Duration::days(1);
+        if self.interval < day && day.num_seconds() % self.interval.num_seconds() != 0 {
+            out.push(format!(
+                "INTERVAL={} does not divide 24h: snapshot times shift from day to day instead \
+                 of landing on the same clock times. Prefer 1h, 2h, 3h, 4h, 6h, 8h or 12h.",
+                fmt_dur(self.interval)
+            ));
+        }
+        for level in self.levels() {
+            let span = level.end - level.start;
+            if level.number > 1 && span < level.spacing * 2 {
+                out.push(format!(
+                    "level {} spans only {} but keeps one snapshot per {}: it will hold at most \
+                     {} snapshot(s). Widen the gap to the next level / MAX_AGE, or drop it.",
+                    level.number,
+                    fmt_dur(span),
+                    fmt_dur(level.spacing),
+                    level.expected()
+                ));
+            }
+        }
+        let total: i64 = self.levels().iter().map(Level::expected).sum();
+        if total > 500 {
+            out.push(format!(
+                "this schedule keeps about {total} snapshots per PVC; many CSI backends slow \
+                 down with that many snapshots per volume. Consider a coarser level."
+            ));
+        }
+        out
+    }
+
+    /// The effective levels, newest first: level 1 = every INTERVAL.
+    pub fn levels(&self) -> Vec<Level> {
+        let mut out = vec![];
+        let mut start = Duration::zero();
+        let mut spacing = self.interval;
+        let mut keep_every = 1;
+        for (i, tier) in self.tiers.iter().enumerate() {
+            out.push(Level {
+                number: i + 1,
+                start,
+                end: tier.after,
+                spacing,
+                keep_every,
+            });
+            start = tier.after;
+            spacing = spacing * tier.keep_every as i32;
+            keep_every = tier.keep_every;
+        }
+        out.push(Level {
+            number: self.tiers.len() + 1,
+            start,
+            end: self.max_age,
+            spacing,
+            keep_every,
+        });
+        out
+    }
+}
+
+/// One row of the retention table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Level {
+    pub number: usize,
+    /// Age range [start, end).
+    pub start: Duration,
+    pub end: Duration,
+    /// One snapshot kept per `spacing`.
+    pub spacing: Duration,
+    /// 1 for level 1 ("keep all"), else "keep 1 of N" of the previous level.
+    pub keep_every: u32,
+}
+
+impl Level {
+    /// Steady-state snapshots per PVC in this level.
+    pub fn expected(&self) -> i64 {
+        (self.end - self.start).num_seconds() / self.spacing.num_seconds().max(1)
+    }
+}
+
+/// `7d`, `12h`, `1d12h`, `90m`.
+pub fn fmt_dur(d: Duration) -> String {
+    let secs = d.num_seconds();
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let (hours, rem) = (rem / 3600, rem % 3600);
+    let mins = rem / 60;
+    let mut s = String::new();
+    if days > 0 {
+        s += &format!("{days}d");
+    }
+    if hours > 0 {
+        s += &format!("{hours}h");
+    }
+    if mins > 0 || s.is_empty() {
+        s += &format!("{mins}m");
+    }
+    s
 }
 
 /// `90s`, `15m`, `4h`, `7d`, `2w`, or a combination like `1d12h`.
@@ -327,6 +497,87 @@ mod tests {
         let mut both = BASE.to_vec();
         both.push(("CLAIM_SELECTOR", "app=x"));
         assert!(Config::from_lookup(env(&both)).is_err());
+    }
+
+    fn with(k: &'static str, v: &'static str) -> Vec<(&'static str, &'static str)> {
+        let mut pairs: Vec<(&str, &str)> = BASE.iter().copied().filter(|(x, _)| *x != k).collect();
+        pairs.push((k, v));
+        pairs
+    }
+
+    fn err(pairs: &[(&str, &str)]) -> String {
+        format!("{:#}", Config::from_lookup(env(pairs)).unwrap_err())
+    }
+
+    #[test]
+    fn errors_explain_why() {
+        let e = err(&with("TIERS", "30d:3,7d:2"));
+        assert!(
+            e.contains("level 3") && e.contains("strictly increasing"),
+            "{e}"
+        );
+        let e = err(&with("TIERS", "7d:3,7d:2"));
+        assert!(e.contains("not later than level 2"), "{e}");
+        let e = err(&with("TIERS", "7d:1"));
+        assert!(e.contains("keeps every snapshot"), "{e}");
+        let e = err(&with("TIERS", "3h:3"));
+        assert!(e.contains("before it holds a single snapshot"), "{e}");
+        let e = err(&with("MAX_AGE", "30d"));
+        assert!(e.contains("level 3") && e.contains("Raise MAX_AGE"), "{e}");
+        let e = err(&with("INTERVAL", "30s"));
+        assert!(e.contains("once a minute"), "{e}");
+    }
+
+    #[test]
+    fn levels_table_and_warnings() {
+        let mut pairs = with("MAX_AGE", "60d");
+        pairs.retain(|(k, _)| *k != "MAX_AGE");
+        pairs.push(("MAX_AGE", "60d"));
+        let cfg = Config::from_lookup(env(&pairs)).unwrap();
+        let levels = cfg.levels();
+        let rows: Vec<(String, String, String, u32, i64)> = levels
+            .iter()
+            .map(|l| {
+                (
+                    fmt_dur(l.start),
+                    fmt_dur(l.end),
+                    fmt_dur(l.spacing),
+                    l.keep_every,
+                    l.expected(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("0m".into(), "7d".into(), "4h".into(), 1, 42),
+                ("7d".into(), "30d".into(), "12h".into(), 3, 46),
+                ("30d".into(), "60d".into(), "1d".into(), 2, 30),
+            ]
+        );
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+
+        let odd = Config::from_lookup(env(&with("INTERVAL", "5h"))).unwrap();
+        assert!(
+            odd.warnings()
+                .iter()
+                .any(|w| w.contains("does not divide 24h"))
+        );
+        let thin = Config::from_lookup(env(&with("MAX_AGE", "31d"))).unwrap();
+        assert!(
+            thin.warnings()
+                .iter()
+                .any(|w| w.contains("level 3 spans only 1d")),
+            "{:?}",
+            thin.warnings()
+        );
+    }
+
+    #[test]
+    fn fmt_durations() {
+        assert_eq!(fmt_dur(Duration::hours(36)), "1d12h");
+        assert_eq!(fmt_dur(Duration::days(7)), "7d");
+        assert_eq!(fmt_dur(Duration::minutes(90)), "1h30m");
     }
 
     #[test]

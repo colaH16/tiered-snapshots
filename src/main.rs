@@ -8,7 +8,9 @@
 mod config;
 mod kubeops;
 mod plan;
+mod report;
 mod status;
+mod zone;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -43,6 +45,9 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    for w in cfg.warnings() {
+        println!("warning: {w}");
+    }
     let result = run(&cfg).await;
     let (outcome, error, code) = match &result {
         Ok(()) => (Outcome::Success, None, 0),
@@ -75,17 +80,18 @@ async fn run(cfg: &Config) -> Result<(), RunError> {
     let kube = Kube::new(cfg).await?;
     let claims = kube.claims(cfg).await?;
     let now = Utc::now();
-    let window = plan::window_start(now, cfg.interval, cfg.timezone);
+    let window = plan::window_start(now, cfg.interval, &cfg.timezone);
     let fresh: Vec<(String, String)> = claims
-        .iter()
+        .keys()
         .map(|c| (c.clone(), plan::snapshot_name(c, window)))
         .collect();
     let protected: BTreeSet<String> = fresh.iter().map(|(_, n)| n.clone()).collect();
+    println!("{}", report::policy_table(cfg, now, &claims));
     println!(
         "window {} ({}), claims: {}",
-        window.to_rfc3339(),
+        cfg.timezone.format(window, "%Y-%m-%d %H:%M"),
         cfg.timezone,
-        claims.iter().cloned().collect::<Vec<_>>().join(", ")
+        claims.keys().cloned().collect::<Vec<_>>().join(", ")
     );
 
     if cfg.dry_run {
@@ -94,7 +100,7 @@ async fn run(cfg: &Config) -> Result<(), RunError> {
         }
     } else {
         for (claim, name) in &fresh {
-            match kube.create(cfg, claim, name).await? {
+            match kube.create(cfg, claim, &claims[claim], name).await? {
                 Created::New => println!("created {name}"),
                 Created::AlreadyExists => println!("exists {name} (retry of this window)"),
             }
@@ -109,6 +115,7 @@ async fn run(cfg: &Config) -> Result<(), RunError> {
     let listed = kube.list(cfg).await?;
     let deletions = plan::plan(&listed, now, cfg, &claims, &protected);
     let (mut expired, mut thinned, mut skipped) = (0, 0, 0);
+    let mut removed: BTreeSet<&str> = BTreeSet::new();
     for d in &deletions {
         let why = match d.reason {
             Reason::Expired => "max-age".to_string(),
@@ -122,6 +129,7 @@ async fn run(cfg: &Config) -> Result<(), RunError> {
             skipped += 1;
             continue;
         }
+        removed.insert(d.name.as_str());
         match d.reason {
             Reason::Expired => expired += 1,
             Reason::Thinned { .. } => thinned += 1,
@@ -138,13 +146,29 @@ async fn run(cfg: &Config) -> Result<(), RunError> {
         skipped,
         if cfg.dry_run { " [dry-run]" } else { "" }
     );
+    let kept: Vec<&plan::Snap> = listed
+        .iter()
+        .filter(|s| {
+            plan::owned(s, cfg, &claims) && !s.deleting && !removed.contains(s.name.as_str())
+        })
+        .collect();
+    println!(
+        "{}",
+        report::kept_table(cfg, now, &claims, &kept, cfg.dry_run)
+    );
+    if cfg.dry_run {
+        println!(
+            "  (a real run also adds this window's {} fresh snapshot(s) to L1)",
+            fresh.len()
+        );
+    }
     Ok(())
 }
 
 async fn wait_ready(
     kube: &Kube,
     cfg: &Config,
-    claims: &BTreeSet<String>,
+    claims: &plan::Claims,
     fresh: &[(String, String)],
 ) -> Result<(), RunError> {
     let deadline = Instant::now() + cfg.ready_timeout;
